@@ -25,6 +25,7 @@ jobs:
       - name: Inspect release metadata and apply the rollout fence
         env:
           SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+          BUILD_DISPATCH_TOKEN: ${{ secrets.BUILD_DISPATCH_TOKEN }}
           CHECK_AUTOMATION_ENABLED: ${{ vars.CHECK_AUTOMATION_ENABLED || 'false' }}
           ZERO_PAID_BUDGET_CONFIRMED: ${{ vars.ZERO_PAID_BUDGET_CONFIRMED || 'false' }}
           SYNC_MONTHLY_MINUTE_LIMIT: ${{ vars.SYNC_MONTHLY_MINUTE_LIMIT }}

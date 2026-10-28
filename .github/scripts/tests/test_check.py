@@ -2,6 +2,7 @@ import importlib.util
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).parents[1] / "check.py"
 spec = importlib.util.spec_from_file_location("check", SCRIPT)
@@ -93,6 +94,80 @@ def fixture_api(**kwargs):
     return FakeApi(**kwargs)
 
 
+class GithubApiTokenTests(unittest.TestCase):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def request_auth(self, method, path, *, build_dispatch_token="build-token"):
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                return GithubApiTokenTests.Response()
+
+        api = check_module.GithubApi(
+            "source-token", build_dispatch_token=build_dispatch_token
+        )
+        with patch.object(check_module.urllib.request, "build_opener", return_value=Opener()):
+            api.request(method, path)
+        return requests[-1]
+
+    def test_only_exact_build_dispatch_post_uses_build_token(self):
+        request = self.request_auth(
+            "POST", "/repos/NKU100/cc-switch-build/actions/workflows/build.yml/dispatches"
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer build-token")
+
+    def test_other_routes_methods_and_query_use_source_token(self):
+        cases = (
+            ("GET", "/repos/NKU100/cc-switch-src"),
+            ("POST", "/repos/NKU100/cc-switch-src/actions/workflows/sync.yml/dispatches"),
+            ("POST", "/repos/other/actions/workflows/build.yml/dispatches"),
+            ("GET", "/repos/NKU100/cc-switch-build/actions/workflows/build.yml/dispatches"),
+            ("POST", "/repos/NKU100/cc-switch-build/actions/workflows/build.yml/dispatches?ref=master"),
+        )
+        for method, path in cases:
+            with self.subTest(method=method, path=path):
+                request = self.request_auth(method, path)
+                self.assertEqual(request.get_header("Authorization"), "Bearer source-token")
+
+    def test_missing_build_token_fails_before_opening_dispatch_request(self):
+        class Opener:
+            opened = False
+
+            def open(self, request, timeout):
+                self.opened = True
+                return GithubApiTokenTests.Response()
+
+        opener = Opener()
+        api = check_module.GithubApi("source-token", build_dispatch_token=None)
+        with patch.object(check_module.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(ValueError):
+                api.request("POST", "/repos/NKU100/cc-switch-build/actions/workflows/build.yml/dispatches")
+        self.assertFalse(opener.opened)
+
+    def test_api_base_remains_second_positional_argument(self):
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                return GithubApiTokenTests.Response()
+
+        api = check_module.GithubApi("source-token", "https://api.example.test")
+        with patch.object(check_module.urllib.request, "build_opener", return_value=Opener()):
+            api.request("GET", "/repos/NKU100/cc-switch-src")
+        self.assertEqual(requests[0].full_url, "https://api.example.test/repos/NKU100/cc-switch-src")
+
+
 class CheckDecisionTests(unittest.TestCase):
     def test_state_table(self):
         decide = check_module.decide
@@ -152,6 +227,45 @@ class CheckDecisionTests(unittest.TestCase):
             {"product": "Copilot", "sku": "Copilot", "quantity": 900, "unitType": "seats", "repositoryName": "NKU100/cc-switch-src"},
         ]}
         self.assertEqual(check_module.parse_actions_minutes(report, "NKU100/cc-switch-src"), 60)
+
+    def test_billing_matches_exact_full_or_short_repository_name(self):
+        report = {"usageItems": [
+            {"product": "actions", "sku": "Actions Linux", "quantity": 11,
+             "unitType": "Minutes", "repositoryName": "cc-switch-src"},
+            {"product": "actions", "sku": "Actions Linux ARM", "quantity": 19,
+             "unitType": "Minutes", "repositoryName": "NKU100/cc-switch-src"},
+            {"product": "actions", "sku": "Actions Windows", "quantity": 997,
+             "unitType": "Minutes", "repositoryName": "cc-switch-src-other"},
+        ]}
+        self.assertEqual(check_module.parse_actions_minutes(report, "NKU100/cc-switch-src"), 30)
+
+    def test_billing_accepts_live_actions_casing_and_minutes_skus_but_excludes_storage(self):
+        def row(sku, quantity, unit_type):
+            return {"date": "2026-10-01", "discountAmount": 0, "grossAmount": 0,
+                    "netAmount": 0, "pricePerUnit": 0, "product": "actions",
+                    "quantity": quantity, "repositoryName": "NKU100/cc-switch-src",
+                    "sku": sku, "unitType": unit_type}
+
+        skus = ("Actions Linux", "Actions Linux ARM", "Actions Windows",
+                "Actions Windows ARM", "Actions macOS 3-core")
+        report = {"usageItems": [row(sku, quantity, "Minutes")
+                                  for quantity, sku in enumerate(skus, start=2)]
+                  + [row("Actions storage", 9999, "GigabyteHours")]}
+        self.assertEqual(check_module.parse_actions_minutes(report, "NKU100/cc-switch-src"), 20)
+
+    def test_billing_rejects_unknown_live_actions_skus_units_and_malformed_rows(self):
+        base = {"product": "actions", "sku": "Actions Linux", "quantity": 1,
+                "unitType": "Minutes", "repositoryName": "NKU100/cc-switch-src"}
+        invalid_rows = (
+            {**base, "sku": "Actions unknown"},
+            {**base, "unitType": "GigabyteHours"},
+            {**base, "sku": "Actions storage", "unitType": "Minutes"},
+            {key: value for key, value in base.items() if key != "quantity"},
+        )
+        for row in invalid_rows:
+            with self.subTest(row=row):
+                with self.assertRaises(ValueError):
+                    check_module.parse_actions_minutes({"usageItems": [row]}, "NKU100/cc-switch-src")
 
     def test_billing_unavailable_or_unknown_is_not_zero(self):
         for status in (401, 403, 404, 429):

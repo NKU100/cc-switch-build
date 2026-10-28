@@ -51,11 +51,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GithubApi:
-    def __init__(self, token: str, api_base: str = "https://api.github.com"):
+    def __init__(
+        self,
+        token: str,
+        api_base: str = "https://api.github.com",
+        *,
+        build_dispatch_token: str | None = None,
+    ):
         self._token = token
         self._api_base = api_base.rstrip("/")
+        self._build_dispatch_token = build_dispatch_token
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict | list | None:
+        build_dispatch = (
+            method == "POST"
+            and path == "/repos/NKU100/cc-switch-build/actions/workflows/build.yml/dispatches"
+        )
+        token = self._token
+        if build_dispatch:
+            if not self._build_dispatch_token:
+                raise ValueError("Build dispatch token is not configured")
+            token = self._build_dispatch_token
         url = self._api_base + path if path.startswith("/") else self._api_base + "/" + path
         payload = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
@@ -64,7 +80,7 @@ class GithubApi:
             method=method,
             headers={
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self._token}",
+                "Authorization": f"Bearer {token}",
                 "X-GitHub-Api-Version": "2022-11-28",
                 **({"Content-Type": "application/json"} if payload is not None else {}),
             },
@@ -157,21 +173,34 @@ def _parse_actions_minutes(report: dict, repo: str | None) -> float:
     if not isinstance(rows, list):
         raise ValueError("Billing usageItems must be a list")
     total = 0.0
-    known_skus = {"Actions Linux", "Actions Windows", "Actions macOS"}
+    minute_skus = {
+        "Actions Linux",
+        "Actions Linux ARM",
+        "Actions Windows",
+        "Actions Windows ARM",
+        "Actions macOS",
+        "Actions macOS 3-core",
+    }
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("product"), str):
             raise ValueError("Billing row has invalid schema")
-        if row["product"] != "Actions":
+        if row["product"].casefold() != "actions":
             continue
         if not isinstance(row.get("repositoryName"), str):
             raise ValueError("Actions billing row is missing repositoryName")
-        if repo is not None and row["repositoryName"] != repo:
-            continue
-        if row.get("sku") not in known_skus or row.get("unitType") != "minutes":
+        sku = row.get("sku")
+        unit_type = row.get("unitType")
+        is_storage = sku == "Actions storage" and unit_type == "GigabyteHours"
+        if not is_storage and (sku not in minute_skus or unit_type not in ("minutes", "Minutes")):
             raise ValueError("Unknown Actions billing SKU or unitType")
         quantity = row.get("quantity")
         if type(quantity) not in (int, float) or not math.isfinite(quantity) or quantity < 0:
             raise ValueError("Actions billing quantity must be a nonnegative number")
+        if is_storage or (
+            repo is not None
+            and row["repositoryName"] not in (repo, repo.rsplit("/", 1)[-1])
+        ):
+            continue
         total += float(quantity)
     return total
 
@@ -378,7 +407,7 @@ def main() -> int:
         return 1
     try:
         limit = float(os.environ["SYNC_MONTHLY_MINUTE_LIMIT"])
-        api = GithubApi(token)
+        api = GithubApi(token, build_dispatch_token=os.environ.get("BUILD_DISPATCH_TOKEN"))
         result = check(
             api,
             datetime.now(timezone.utc),
