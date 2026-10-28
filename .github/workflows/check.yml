@@ -1,0 +1,34 @@
+name: Check upstream release
+'on':
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Read metadata and report the decision without dispatching
+        required: true
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: upstream-release-check
+  cancel-in-progress: false
+jobs:
+  check:
+    if: github.repository == 'NKU100/cc-switch-build'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Inspect release metadata and apply the rollout fence
+        env:
+          SRC_TOKEN: ${{ secrets.SRC_TOKEN }}
+          CHECK_AUTOMATION_ENABLED: ${{ vars.CHECK_AUTOMATION_ENABLED || 'false' }}
+          ZERO_PAID_BUDGET_CONFIRMED: ${{ vars.ZERO_PAID_BUDGET_CONFIRMED || 'false' }}
+          SYNC_MONTHLY_MINUTE_LIMIT: ${{ vars.SYNC_MONTHLY_MINUTE_LIMIT }}
+          ACCOUNT_FREE_ACTIONS_MINUTES: ${{ vars.ACCOUNT_FREE_ACTIONS_MINUTES }}
+          ACCOUNT_ACTIONS_MINUTE_RESERVE: ${{ vars.ACCOUNT_ACTIONS_MINUTE_RESERVE }}
+          CHECK_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: python3 .github/scripts/check.py
